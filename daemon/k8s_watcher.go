@@ -817,26 +817,33 @@ func (d *Daemon) EnableK8sWatcher(queueSize uint) error {
 			}
 			podController := createPodController(fields.Everything())
 
-			isConnected := make(chan struct{})
-			// once isConnected is closed, it will stop waiting on caches to be
+			stopController := make(chan struct{})
+			// once stopController is closed, it will stop waiting on caches to be
 			// synchronized.
-			d.blockWaitGroupToSyncResources(isConnected, podController, k8sAPIGroupPodV1Core)
+			d.blockWaitGroupToSyncResources(stopController, podController, k8sAPIGroupPodV1Core)
 			once.Do(func() {
 				asyncControllers.Done()
 				d.k8sAPIGroups.addAPI(k8sAPIGroupPodV1Core)
 			})
-			go podController.Run(isConnected)
+			go podController.Run(stopController)
 
-			// Replace pod controller by only receiving events from our own
-			// node once we are connected to the kvstore.
-			<-kvstore.Client().Connected()
-			close(isConnected)
+			// Wait for kvstore to be connected and consider
+			// switching to kvstore based event handling if the
+			// optimization is enabled
+			for {
+				<-kvstore.Client().Connected()
+				if option.Config.K8sEventHandover {
+					close(stopController)
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
 
-			log.WithField(logfields.Node, node.GetName()).Info("Connected to KVStore, watching for pod events on node")
-			// Only watch for pod events for our node.
+			// Replace pod controller by only receiving events from
+			// our own node
 			podController = createPodController(fields.ParseSelectorOrDie("spec.nodeName=" + node.GetName()))
-			isConnected = make(chan struct{})
-			go podController.Run(isConnected)
+			stopController = make(chan struct{})
+			go podController.Run(stopController)
 
 			// Create a new pod controller when we are disconnected with the
 			// kvstore
@@ -913,10 +920,10 @@ func (d *Daemon) EnableK8sWatcher(queueSize uint) error {
 				},
 				k8s.ConvertToNode,
 			)
-			isConnected := make(chan struct{})
-			// once isConnected is closed, it will stop waiting on caches to be
+			stopController := make(chan struct{})
+			// once stopController is closed, it will stop waiting on caches to be
 			// synchronized.
-			d.blockWaitGroupToSyncResources(isConnected, nodeController, k8sAPIGroupNodeV1Core)
+			d.blockWaitGroupToSyncResources(stopController, nodeController, k8sAPIGroupNodeV1Core)
 
 			once.Do(func() {
 				// Signalize that we have put node controller in the wait group
@@ -924,11 +931,22 @@ func (d *Daemon) EnableK8sWatcher(queueSize uint) error {
 				asyncControllers.Done()
 			})
 			d.k8sAPIGroups.addAPI(k8sAPIGroupNodeV1Core)
-			go nodeController.Run(isConnected)
-			// TODO: do we really need to wait until etcd watcher signalizes
-			// "listDone" or connected to it is sufficient?
-			<-kvstore.Client().Connected()
-			close(isConnected)
+			go nodeController.Run(stopController)
+
+			// Wait for kvstore to be connected and consider
+			// switching to kvstore based event handling if the
+			// optimization is enabled
+			for {
+				// TODO: do we really need to wait until etcd
+				// watcher signalizes "listDone" or connected
+				// to it is sufficient?
+				<-kvstore.Client().Connected()
+				if option.Config.K8sEventHandover {
+					close(stopController)
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
 
 			log.Info("Connected to KVStore, stopping k8s node watcher")
 
